@@ -26,7 +26,8 @@ let cur = 0;
 let hooks = {};
 let isOpen = false;
 
-const view = { fit: 1, s: 1, zoom: 1, tx: 0, ty: 0 };
+// 表示：s = 倍率、rot = 紙の角度（度）、cx/cy = 紙の中心の画面上の位置
+const view = { fit: 1, s: 1, zoom: 1, rot: 0, cx: 0, cy: 0 };
 let W = 0, H = 0, dpr = 1;
 let stageRect = null;
 
@@ -61,6 +62,7 @@ export async function openEditor(notebook, opts) {
   isOpen = true;
   $('#nb-title').textContent = nb.name;
   closePanels();
+  view.rot = 0;
   resize();
   resetView();
   redraw();
@@ -123,26 +125,63 @@ function resize() {
     c.style.width = W + 'px';
     c.style.height = H + 'px';
   }
-  view.fit = Math.min((W - 28) / PAGE_W, (H - 28) / PAGE_H);
+  view.fit = fitFor(view.rot);
+}
+
+// 傾けた紙の外枠（画面上の幅・高さ）
+function boundsFor(rot, scale) {
+  const r = (rot * Math.PI) / 180;
+  const c = Math.abs(Math.cos(r));
+  const sn = Math.abs(Math.sin(r));
+  return [(PAGE_W * c + PAGE_H * sn) * scale, (PAGE_W * sn + PAGE_H * c) * scale];
+}
+
+// その角度で紙全体が画面に収まる倍率
+function fitFor(rot) {
+  const [bw, bh] = boundsFor(rot, 1);
+  return Math.min((W - 28) / bw, (H - 28) / bh);
 }
 
 function resetView() {
+  view.fit = fitFor(view.rot);
   view.zoom = 1;
   view.s = view.fit;
-  view.tx = (W - PAGE_W * view.s) / 2;
-  view.ty = (H - PAGE_H * view.s) / 2;
+  view.cx = W / 2;
+  view.cy = H / 2;
 }
 
 function clampView() {
-  const pw = PAGE_W * view.s;
-  const ph = PAGE_H * view.s;
+  const [bw, bh] = boundsFor(view.rot, view.s);
   const m = 60;
-  view.tx = pw <= W ? (W - pw) / 2 : Math.min(m, Math.max(W - pw - m, view.tx));
-  view.ty = ph <= H ? (H - ph) / 2 : Math.min(m, Math.max(H - ph - m, view.ty));
+  view.cx = bw <= W ? W / 2 : Math.min(m + bw / 2, Math.max(W - m - bw / 2, view.cx));
+  view.cy = bh <= H ? H / 2 : Math.min(m + bh / 2, Math.max(H - m - bh / 2, view.cy));
+}
+
+// ページ座標 → 画面座標 の変換行列
+function matrix() {
+  const r = (view.rot * Math.PI) / 180;
+  const a = view.s * Math.cos(r);
+  const b = view.s * Math.sin(r);
+  return { a, b, c: -b, d: a, e: view.cx - (a * PAGE_W) / 2 + (b * PAGE_H) / 2, f: view.cy - (b * PAGE_W) / 2 - (a * PAGE_H) / 2 };
+}
+
+function toScreen(x, y) {
+  const m = matrix();
+  return [m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f];
+}
+
+function toPageXY(sx, sy) {
+  const r = (view.rot * Math.PI) / 180;
+  const cos = Math.cos(r);
+  const sin = Math.sin(r);
+  const vx = (sx - view.cx) / view.s;
+  const vy = (sy - view.cy) / view.s;
+  return [cos * vx + sin * vy + PAGE_W / 2, -sin * vx + cos * vy + PAGE_H / 2];
 }
 
 function applyT(ctx) {
-  ctx.setTransform(dpr * view.s, 0, 0, dpr * view.s, dpr * view.tx, dpr * view.ty);
+  const m = matrix();
+  ctx.setTransform(dpr * m.a, dpr * m.b, dpr * m.c, dpr * m.d, dpr * m.e, dpr * m.f);
 }
 
 function clipPage(ctx) {
@@ -242,13 +281,20 @@ function renderLive() {
   lctx.restore();
 }
 
-window.addEventListener('resize', () => {
+// 画面サイズが変わったら作り直す。iOSの resize イベントはレイアウト確定前に来ることがあり、
+// 古いサイズで中央を計算するとページが横にずれたままになるため、ResizeObserver で確定後のサイズを使う。
+function onStageResize() {
   if (!isOpen) return;
+  const r = stage.getBoundingClientRect();
+  if (Math.abs(r.width - W) < 1 && Math.abs(r.height - H) < 1) return;
   cancelFlipNow();
   resize();
   resetView();
   redraw();
-});
+}
+if ('ResizeObserver' in window) new ResizeObserver(onStageResize).observe(stage);
+window.addEventListener('resize', () => requestAnimationFrame(onStageResize));
+window.addEventListener('orientationchange', () => setTimeout(onStageResize, 300));
 
 /* ================= 描画 ================= */
 let stroke = null; // 描いている途中の線（ペン or 消しゴム）
@@ -258,7 +304,7 @@ let holdTimer = null;
 let holdAnchor = null;
 
 function toPage(e) {
-  return [(e.clientX - stageRect.left - view.tx) / view.s, (e.clientY - stageRect.top - view.ty) / view.s];
+  return toPageXY(e.clientX - stageRect.left, e.clientY - stageRect.top);
 }
 
 function pressureOf(e) {
@@ -356,6 +402,7 @@ function endDraw() {
   composite();
   renderLive();
   markDirty();
+  if (needSettle && !touches.size) settleView();
 }
 
 function abortDraw() {
@@ -514,8 +561,9 @@ async function insertImageBlob(blob) {
   const w = c.width * fit;
   const h = c.height * fit;
   // いま見えている範囲の中央に置く
-  const cx = Math.min(PAGE_W - w / 2, Math.max(w / 2, (W / 2 - view.tx) / view.s));
-  const cy = Math.min(PAGE_H - h / 2, Math.max(h / 2, (H / 2 - view.ty) / view.s));
+  const [pcx, pcy] = toPageXY(W / 2, H / 2);
+  const cx = Math.min(PAGE_W - w / 2, Math.max(w / 2, pcx));
+  const cy = Math.min(PAGE_H - h / 2, Math.max(h / 2, pcy));
   const item = { id: uid(), src, x: r2(cx - w / 2), y: r2(cy - h / 2), w: r2(w), h: r2(h) };
   pages[cur].images.push(item);
   pushHistory({ type: 'img-add', item });
@@ -596,16 +644,22 @@ function startImageEdit(item) {
 function positionImageEdit() {
   if (!editItem) return;
   const f = $('.img-frame', imgEdit);
-  const left = view.tx + editItem.x * view.s;
-  const top = view.ty + editItem.y * view.s;
+  const [sx, sy] = toScreen(editItem.x + editItem.w / 2, editItem.y + editItem.h / 2);
   const w = editItem.w * view.s;
   const h = editItem.h * view.s;
-  Object.assign(f.style, { left: left + 'px', top: top + 'px', width: w + 'px', height: h + 'px' });
+  Object.assign(f.style, {
+    left: sx - w / 2 + 'px', top: sy - h / 2 + 'px', width: w + 'px', height: h + 'px',
+    transform: `rotate(${view.rot}deg)`,
+  });
+  // 傾いている時は外枠の高さでボタンの位置を決める
+  const rr = (view.rot * Math.PI) / 180;
+  const bh = Math.abs(w * Math.sin(rr)) + Math.abs(h * Math.cos(rr));
   const tools = $('.img-tools', imgEdit);
+  const top = sy - bh / 2;
   const above = top - 52 > 6;
   Object.assign(tools.style, {
-    left: Math.max(8, Math.min(W - 170, left + w / 2 - 80)) + 'px',
-    top: (above ? top - 52 : Math.min(H - 52, top + h + 10)) + 'px',
+    left: Math.max(8, Math.min(W - 170, sx - 80)) + 'px',
+    top: (above ? top - 52 : Math.min(H - 52, sy + bh / 2 + 10)) + 'px',
   });
 }
 
@@ -632,8 +686,12 @@ frame.addEventListener('pointerdown', (e) => {
 });
 frame.addEventListener('pointermove', (e) => {
   if (!imgDrag || e.pointerId !== imgDrag.id) return;
-  const dx = (e.clientX - imgDrag.sx) / view.s;
-  const dy = (e.clientY - imgDrag.sy) / view.s;
+  // 画面上の動きを、紙の向きに合わせた動きに直す
+  const r = (view.rot * Math.PI) / 180;
+  const ex = e.clientX - imgDrag.sx;
+  const ey = e.clientY - imgDrag.sy;
+  const dx = (Math.cos(r) * ex + Math.sin(r) * ey) / view.s;
+  const dy = (-Math.sin(r) * ex + Math.cos(r) * ey) / view.s;
   const r0 = imgDrag.r0;
   const ratio = r0.h / r0.w;
   const it = editItem;
@@ -692,7 +750,7 @@ function snapshot(page) {
 
 // dir: +1 = 次へ / -1 = 前へ。めくれるページが無ければ null
 function startFlip(dir) {
-  if (flip) return null;
+  if (flip || view.rot !== 0) return null; // 紙を傾けている時はめくりアニメーションなし
   let target = null;
   let virtual = false;
   if (dir > 0) {
@@ -713,7 +771,7 @@ function startFlip(dir) {
   const sw = PAGE_W * view.s;
   const sh = PAGE_H * view.s;
   flipLayer.innerHTML = '';
-  Object.assign(flipLayer.style, { left: view.tx + 'px', top: view.ty + 'px', width: sw + 'px', height: sh + 'px' });
+  Object.assign(flipLayer.style, { left: view.cx - sw / 2 + 'px', top: view.cy - sh / 2 + 'px', width: sw + 'px', height: sh + 'px' });
 
   // 下の紙：次へ = めくった先のページ / 前へ = 今のページ
   const underShade = el('div', { class: 'flip-under-shade' });
@@ -768,15 +826,30 @@ function cancelFlipNow() {
   flipLayer.innerHTML = '';
 }
 
-function nextPage() {
+async function turnPage(dir) {
   if (flip) return;
-  if (startFlip(1)) finishFlip(true, 520);
-  else toast('最後のページです');
+  if (view.rot === 0) {
+    if (startFlip(dir)) return finishFlip(true, 520);
+  } else if (dir > 0) {
+    // 傾けている時はアニメーションなしでページを切り替える
+    if (cur < pages.length - 1) return goTo(cur + 1);
+    if (pages[cur].strokes.length || pages[cur].images.length) {
+      goTo(await addPage());
+      return toast('新しいページを追加しました');
+    }
+  } else if (cur > 0) {
+    return goTo(cur - 1);
+  }
+  if (dir > 0) toast('最後のページです');
 }
 
-function prevPage() {
-  if (flip) return;
-  if (startFlip(-1)) finishFlip(true, 520);
+const nextPage = () => turnPage(1);
+const prevPage = () => turnPage(-1);
+
+function resetRotation() {
+  view.rot = 0;
+  resetView();
+  redraw();
 }
 
 /* ================= ポインター（ペン・指・マウス） ================= */
@@ -788,6 +861,9 @@ let tap = null; // 2本指・3本指タップの判定
 const pt = (e) => ({ x: e.clientX - stageRect.left, y: e.clientY - stageRect.top });
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+const angleOf = (a, b) => (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI;
+const norm180 = (d) => ((((d + 180) % 360) + 360) % 360) - 180;
+const SNAP = 8; // 上下左右（0°・90°・180°・270°）に吸い付く範囲
 
 function capture(e) {
   try {
@@ -804,7 +880,31 @@ function canDraw(e) {
 function cancelTouchGesture() {
   clearTimeout(lpTimer);
   tap = null;
-  if (touches.size) gesture = { type: 'none' };
+  if (touches.size) {
+    gesture = { type: 'none' };
+    needSettle = true; // ピンチ等の途中でペンを置いた：あとで表示を整える
+  }
+}
+
+// 回転中に角度を表示
+let angleTimer = null;
+function showAngle(rot) {
+  const badge = $('#angle-badge');
+  const deg = Math.round(rot > 180 ? rot - 360 : rot);
+  badge.textContent = `${deg}°`;
+  badge.classList.toggle('snapped', rot % 90 === 0);
+  badge.classList.remove('hidden');
+  clearTimeout(angleTimer);
+  angleTimer = setTimeout(() => badge.classList.add('hidden'), 900);
+}
+
+// 拡大率・位置を正しい範囲に戻す（ほぼ等倍なら中央に戻す）
+let needSettle = false;
+function settleView() {
+  needSettle = false;
+  if (view.zoom < 1.03) resetView();
+  else clampView();
+  redraw();
 }
 
 function trackTap(id, p) {
@@ -820,7 +920,7 @@ function startGesture({ allowSwipe = true } = {}) {
     const p = pts[0];
     gesture = {
       type: 'one', sx: p.x, sy: p.y, t: performance.now(),
-      tx0: view.tx, ty0: view.ty, moved: false, allowSwipe, flipTried: false, flip: null,
+      cx0: view.cx, cy0: view.cy, moved: false, allowSwipe, flipTried: false, flip: null,
     };
     if (allowSwipe) {
       lpTimer = setTimeout(() => {
@@ -834,7 +934,10 @@ function startGesture({ allowSwipe = true } = {}) {
   } else if (pts.length >= 2) {
     if (gesture && gesture.flip) finishFlip(false);
     const [a, b] = pts;
-    gesture = { type: 'pinch', d0: dist(a, b) || 1, m0: mid(a, b), s0: view.s, tx0: view.tx, ty0: view.ty };
+    gesture = {
+      type: 'pinch', d0: dist(a, b) || 1, m0: mid(a, b), a0: angleOf(a, b),
+      s0: view.s, z0: view.zoom, rot0: view.rot, cx0: view.cx, cy0: view.cy, rotated: false,
+    };
   }
 }
 
@@ -920,8 +1023,8 @@ stage.addEventListener('pointermove', (e) => {
     }
     if (!gesture.moved) return;
     if (view.zoom > 1.01) {
-      view.tx = gesture.tx0 + dx;
-      view.ty = gesture.ty0 + dy;
+      view.cx = gesture.cx0 + dx;
+      view.cy = gesture.cy0 + dy;
       clampView();
       scheduleRedraw();
     } else if (gesture.allowSwipe) {
@@ -936,20 +1039,33 @@ stage.addEventListener('pointermove', (e) => {
         const a = Math.acos(c) / Math.PI;
         setFlip(gesture.flip.dir > 0 ? a : 1 - a);
       } else if (gesture.flipTried) {
-        view.tx = gesture.tx0 + dx * 0.25; // めくれない時は少しだけ動いて戻る
+        view.cx = gesture.cx0 + dx * 0.25; // めくれない時は少しだけ動いて戻る
         scheduleRedraw();
       }
     }
   } else if (gesture.type === 'pinch' && touches.size >= 2) {
     const [a, b] = [...touches.values()];
     const m = mid(a, b);
-    const s = Math.min(view.fit * 5, Math.max(view.fit * 0.8, (gesture.s0 * dist(a, b)) / gesture.d0));
-    const px = (gesture.m0.x - gesture.tx0) / gesture.s0;
-    const py = (gesture.m0.y - gesture.ty0) / gesture.s0;
+    // 回転：2本指のひねった角度だけ紙を回す。上下左右の近くでは吸い付く
+    let rot = gesture.rot0 + norm180(angleOf(a, b) - gesture.a0);
+    const snapped = Math.round(rot / 90) * 90;
+    if (Math.abs(rot - snapped) < SNAP) rot = snapped;
+    rot = ((rot % 360) + 360) % 360;
+    if (rot !== gesture.rot0) gesture.rotated = true;
+    view.rot = rot;
+    view.fit = fitFor(rot);
+    // 拡大縮小（「画面に収まる大きさ」に対する倍率で考える：回しても紙が画面からはみ出さない）
+    const s = view.fit * Math.min(5, Math.max(0.8, (gesture.z0 * dist(a, b)) / gesture.d0));
+    // 指の間の点が、つまんだ時と同じ紙の位置に来るように中心を動かす
+    const dr = ((rot - gesture.rot0) * Math.PI) / 180;
+    const k = s / gesture.s0;
+    const vx = gesture.cx0 - gesture.m0.x;
+    const vy = gesture.cy0 - gesture.m0.y;
+    view.cx = m.x + k * (Math.cos(dr) * vx - Math.sin(dr) * vy);
+    view.cy = m.y + k * (Math.sin(dr) * vx + Math.cos(dr) * vy);
     view.s = s;
     view.zoom = s / view.fit;
-    view.tx = m.x - px * s;
-    view.ty = m.y - py * s;
+    if (gesture.rotated) showAngle(rot);
     scheduleRedraw();
   }
 });
@@ -982,9 +1098,14 @@ function onPointerEnd(e) {
     const flick = dt < 350 && Math.abs(dx) > 50 && Math.sign(-dx) === gesture.flip.dir;
     finishFlip(e.type !== 'pointercancel' && (gesture.flip.p > 0.35 || flick));
   } else if (gesture && gesture.type === 'one' && view.zoom <= 1.01 && gesture.allowSwipe) {
-    if (gesture.flipTried && p.x < gesture.sx - 60) toast('最後のページです');
+    const dx = p.x - gesture.sx;
+    const dy = p.y - gesture.sy;
     resetView();
     scheduleRedraw();
+    if (e.type !== 'pointercancel' && gesture.flipTried && Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      if (view.rot !== 0) turnPage(dx < 0 ? 1 : -1);
+      else if (dx < 0) toast('最後のページです');
+    }
   } else if (gesture && gesture.type === 'pinch') {
     const wasTap = tap && tap.ok;
     if (!wasTap) {
@@ -999,6 +1120,9 @@ function onPointerEnd(e) {
   } else {
     gesture = null;
     finishTap();
+    // 書いている途中なら、書き終わってから整える（ペン先の下でページが動かないように）
+    if (stroke) needSettle = true;
+    else settleView();
   }
 }
 stage.addEventListener('pointerup', onPointerEnd);
@@ -1013,16 +1137,15 @@ stage.addEventListener(
     stageRect = stage.getBoundingClientRect();
     if (e.ctrlKey || e.metaKey) {
       const p = pt(e);
-      const s = Math.min(view.fit * 5, Math.max(view.fit, view.s * Math.exp(-e.deltaY * 0.01)));
-      const px = (p.x - view.tx) / view.s;
-      const py = (p.y - view.ty) / view.s;
-      view.s = s;
-      view.zoom = s / view.fit;
-      view.tx = p.x - px * s;
-      view.ty = p.y - py * s;
+      const [px, py] = toPageXY(p.x, p.y);
+      view.s = Math.min(view.fit * 5, Math.max(view.fit, view.s * Math.exp(-e.deltaY * 0.01)));
+      view.zoom = view.s / view.fit;
+      const [nx, ny] = toScreen(px, py);
+      view.cx += p.x - nx;
+      view.cy += p.y - ny;
     } else if (view.zoom > 1.01) {
-      view.tx -= e.deltaX;
-      view.ty -= e.deltaY;
+      view.cx -= e.deltaX;
+      view.cy -= e.deltaY;
     }
     clampView();
     scheduleRedraw();
@@ -1095,7 +1218,7 @@ function openPageMenu(x, y) {
   if (flip) return;
   const items = [];
   if (stageRect) {
-    const item = imageAt((x - stageRect.left - view.tx) / view.s, (y - stageRect.top - view.ty) / view.s);
+    const item = imageAt(...toPageXY(x - stageRect.left, y - stageRect.top));
     if (item) {
       items.push(
         { label: '画像を移動・拡大縮小', action: () => startImageEdit(item) },
@@ -1112,6 +1235,7 @@ function openPageMenu(x, y) {
     { label: '1冊まるごとPDFに書き出し', action: exportAll },
     '-',
     { label: 'ページを追加', action: async () => goTo(await addPage(cur + 1)) },
+    ...(view.rot !== 0 ? [{ label: '紙の向きをまっすぐに戻す', action: resetRotation }] : []),
     { label: 'このページを全消し', danger: true, action: clearPage },
   );
   showMenu(x, y, items);
@@ -1236,20 +1360,7 @@ function renderPenPanel() {
     },
   });
 
-  const colors = el('div', { class: 'swatches' });
-  for (const c of COLORS) {
-    colors.append(
-      el('button', {
-        class: 'swatch' + (c === pen.color ? ' selected' : ''),
-        style: `background:${c}`,
-        'aria-label': c,
-        onclick: () => {
-          pen.color = c;
-          penChanged();
-        },
-      }),
-    );
-  }
+  const colors = colorSection(pen);
 
   penPanel.append(
     section('ペンの種類', types),
@@ -1258,6 +1369,100 @@ function renderPenPanel() {
     toggleRow('図形の自動補正', '線・円・四角・三角を書いて、最後にペンを少し止めると整います', settings.shapeSnap, (v) => (settings.shapeSnap = v)),
     fingerRow(),
   );
+}
+
+/* --- 色：基本の8色（編集可）＋ほかの色 --- */
+let paletteEdit = false;
+const sameColor = (a, b) => a.toLowerCase() === b.toLowerCase();
+
+function isLight(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  return 0.299 * r + 0.587 * g + 0.114 * b > 200;
+}
+
+// 色選択の丸。<label> の中に透明な <input type=color> を重ねると、タップでiPadの色選択が開く
+function colorPicker({ value, cls, label, onInput, onChange }) {
+  const input = el('input', { type: 'color', value: value.toLowerCase(), 'aria-label': label });
+  input.addEventListener('input', () => onInput(input.value));
+  input.addEventListener('change', () => onChange(input.value));
+  return el('label', { class: `swatch picker ${cls}` }, input);
+}
+
+function colorSection(pen) {
+  const grid = el('div', { class: 'swatches' + (paletteEdit ? ' editing' : '') });
+  settings.palette.forEach((c, i) => {
+    if (paletteEdit) {
+      const sw = colorPicker({
+        value: c,
+        cls: 'edit' + (isLight(c) ? ' light' : ''),
+        label: `色${i + 1}を変更`,
+        onInput: (v) => {
+          settings.palette[i] = v;
+          pen.color = v;
+          sw.style.background = v;
+          sw.classList.toggle('light', isLight(v));
+          updatePenButtons();
+        },
+        onChange: () => saveSettings(),
+      });
+      sw.style.background = c;
+      grid.append(sw);
+    } else {
+      grid.append(
+        el('button', {
+          class: 'swatch' + (sameColor(c, pen.color) ? ' selected' : '') + (isLight(c) ? ' light' : ''),
+          style: `background:${c}`,
+          'aria-label': c,
+          onclick: () => {
+            pen.color = c;
+            penChanged();
+          },
+        }),
+      );
+    }
+  });
+
+  // ほかの色（パレットにない色を自由に）
+  const custom = !settings.palette.some((c) => sameColor(c, pen.color));
+  const other = colorPicker({
+    value: pen.color,
+    cls: 'rainbow' + (custom && !paletteEdit ? ' selected' : ''),
+    label: 'ほかの色',
+    onInput: (v) => {
+      pen.color = v;
+      other.style.setProperty('--picked', v);
+      updatePenButtons();
+    },
+    onChange: () => {
+      saveSettings();
+      renderPenPanel();
+    },
+  });
+  if (custom) other.style.setProperty('--picked', pen.color);
+  if (!paletteEdit) grid.append(other);
+
+  const actions = el('div', { class: 'color-actions' });
+  if (paletteEdit) {
+    actions.append(
+      el('span', { class: 'color-hint', text: '丸をタップして変更' }),
+      el('button', {
+        text: '初期の色に戻す',
+        onclick: () => {
+          settings.palette = COLORS.slice();
+          saveSettings();
+          renderPenPanel();
+        },
+      }),
+      el('button', { class: 'primary', text: '完了', onclick: () => { paletteEdit = false; renderPenPanel(); } }),
+    );
+  } else {
+    actions.append(
+      el('span', { class: 'color-hint', text: custom ? `ほかの色：${pen.color}` : '' }),
+      el('button', { text: '色を編集', onclick: () => { paletteEdit = true; renderPenPanel(); } }),
+    );
+  }
+  return el('div', { class: 'color-box' }, [grid, actions]);
 }
 
 function renderEraserPanel() {
@@ -1348,14 +1553,19 @@ function updateUI() {
   const h = history.get(pages[cur].id);
   $('#undo-btn').disabled = !h || !h.undo.length;
   $('#redo-btn').disabled = !h || !h.redo.length;
+  updatePenButtons();
+  $('#eraser-btn').classList.toggle('active', tool === 'eraser');
+  if (!penPanel.classList.contains('hidden')) openPanel();
+}
+
+function updatePenButtons() {
   settings.pens.forEach((p, i) => {
     const btn = $(`#pen${i + 1}-btn`);
     btn.classList.toggle('active', tool === 'pen' && settings.activePen === i);
     btn.style.setProperty('--pen-color', p.color);
+    btn.classList.toggle('light-pen', isLight(p.color)); // 白などの明るい色はアイコンを縁取り
     btn.title = `ペン${i + 1}（${PENS[p.type].label}）`;
   });
-  $('#eraser-btn').classList.toggle('active', tool === 'eraser');
-  if (!penPanel.classList.contains('hidden')) openPanel();
 }
 
 $('#back-btn').addEventListener('click', () => hooks.onExit && hooks.onExit());

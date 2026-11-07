@@ -1,5 +1,5 @@
 // オフライン対応：アプリ本体をキャッシュ（更新は次回起動時に反映）
-const CACHE = 'ipad-note-v3';
+const CACHE = 'ipad-note-v5';
 const ASSETS = [
   './',
   'index.html',

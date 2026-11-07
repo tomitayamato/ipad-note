@@ -258,10 +258,26 @@ svg.filled, .round-btn svg circle { fill: currentColor; stroke: none; }
 .flip-layer.animating .flip-shade,
 .flip-layer.animating .flip-under-shade { transition: opacity var(--flip-ms, 320ms) ease; }
 
+/* ---------- 回転中の角度表示 ---------- */
+.angle-badge {
+  position: absolute; left: 50%; top: 14px;
+  transform: translateX(-50%);
+  padding: 6px 16px;
+  border-radius: 18px;
+  background: rgba(43, 39, 35, .82);
+  color: #fff;
+  font-size: 15px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  z-index: 6;
+}
+.angle-badge.snapped { background: var(--accent); }
+
 /* ---------- 画像の移動・拡大縮小 ---------- */
 .img-edit { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
 .img-frame {
   position: absolute;
+  transform-origin: 50% 50%;
   border: 2px solid var(--accent);
   box-shadow: 0 0 0 9999px rgba(30, 24, 18, .12);
   pointer-events: auto;
@@ -369,7 +385,39 @@ svg.filled, .round-btn svg circle { fill: currentColor; stroke: none; }
   box-shadow: 0 0 0 1px rgba(0, 0, 0, .15);
 }
 .swatch.selected { box-shadow: 0 0 0 2.5px var(--accent); }
-.popover .swatches { gap: 8px; }
+.popover .swatches { gap: 4px; justify-content: space-between; }
+.swatch.light { box-shadow: 0 0 0 1px rgba(0, 0, 0, .25); }
+.swatch.light.selected { box-shadow: 0 0 0 2.5px var(--accent); }
+.swatch.picker { position: relative; display: inline-block; cursor: pointer; overflow: hidden; }
+.swatch.picker input {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  opacity: 0; border: none; padding: 0; margin: 0;
+  cursor: pointer;
+}
+/* ほかの色：虹色の輪。選んだ色があれば中心に表示 */
+.swatch.rainbow {
+  background:
+    radial-gradient(circle, var(--picked, #fff) 0 42%, transparent 44%),
+    conic-gradient(#ff3b30, #ff9500, #ffcc00, #34c759, #00c7be, #007aff, #af52de, #ff2d55, #ff3b30);
+}
+.swatches.editing .swatch.edit { box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--accent); }
+.swatches.editing .swatch.edit::after {
+  content: '✎';
+  position: absolute; right: -2px; bottom: -2px;
+  width: 15px; height: 15px; border-radius: 50%;
+  background: var(--accent); color: #fff;
+  font-size: 10px; line-height: 15px; text-align: center;
+  pointer-events: none;
+}
+.color-box { display: flex; flex-direction: column; gap: 10px; }
+.color-actions { display: flex; align-items: center; gap: 8px; }
+.color-hint { flex: 1; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.color-actions button { height: 32px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font-size: 13px; }
+.color-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+/* 白など明るい色のペン：ツールバーのアイコンを縁取り */
+.pen-slot.light-pen svg { filter: drop-shadow(0 0 1px rgba(0, 0, 0, .7)); }
+.pen-slot.light-pen .pen-dot { box-shadow: 0 0 0 1px rgba(0, 0, 0, .35); }
 .popover .swatch { width: 30px; height: 30px; }
 .swatch.cover { border-radius: 6px; width: 34px; height: 42px; }
 .dialog .swatches { gap: 8px; }
@@ -391,7 +439,7 @@ svg.filled, .round-btn svg circle { fill: currentColor; stroke: none; }
 .pp-title { font-weight: 700; font-size: 15px; margin-bottom: 12px; }
 .pp-section { padding-bottom: 14px; margin-bottom: 12px; border-bottom: 1px solid #efebe5; }
 .slider-box { display: flex; flex-direction: column; gap: 6px; }
-.width-preview { display: grid; place-items: center; min-height: 44px; background: #faf8f5; border-radius: 10px; overflow: hidden; }
+.width-preview { display: grid; place-items: center; min-height: 44px; background: #e9e5de; border-radius: 10px; overflow: hidden; }
 .width-preview svg { width: 100%; height: 44px; }
 .eraser-dot { margin: 8px 0; border-radius: 50%; background: #f4f0ea; border: 1.5px solid #8a8279; }
 .slider-row { display: flex; align-items: center; gap: 12px; }

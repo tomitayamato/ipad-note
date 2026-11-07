@@ -12,7 +12,8 @@ export const PENS = {
 export const ERASER = { min: 6, max: 120, def: 30 };
 const ERASER_STYLE = { pressure: false, alpha: 1 };
 
-export const COLORS = ['#1f1f1f', '#5f6368', '#d93025', '#e8710a', '#f9ab00', '#188038', '#1a73e8', '#8e44ad'];
+// 基本の8色（黒・赤・青・緑・黄・オレンジ・紫・白）。ペンの設定で自由に編集できる
+export const COLORS = ['#1f1f1f', '#d93025', '#1a73e8', '#188038', '#f9ab00', '#e8710a', '#8e44ad', '#ffffff'];
 
 export const PAPERS = { blank: '白紙', lined: '罫線', grid: '方眼' };
 

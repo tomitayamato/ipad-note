@@ -1,5 +1,5 @@
 import { db } from './db.js';
-import { PENS, ERASER } from './render.js';
+import { PENS, ERASER, COLORS } from './render.js';
 
 const DEFAULTS = {
   // 上部に置く2本のペン（よく使う：黒ペン・赤ペン）
@@ -11,6 +11,7 @@ const DEFAULTS = {
   eraserWidth: ERASER.def,
   fingerDraw: false,
   shapeSnap: true, // 書き終わりでペンを止めると図形に補正
+  palette: COLORS.slice(), // 色のパレット（自由に編集できる）
 };
 
 export const settings = JSON.parse(JSON.stringify(DEFAULTS));
@@ -28,6 +29,9 @@ export async function loadSettings() {
   if (typeof v.eraserWidth === 'number') settings.eraserWidth = v.eraserWidth;
   settings.fingerDraw = !!v.fingerDraw;
   if (typeof v.shapeSnap === 'boolean') settings.shapeSnap = v.shapeSnap;
+  if (Array.isArray(v.palette) && v.palette.length === COLORS.length && v.palette.every((c) => /^#[0-9a-f]{6}$/i.test(c))) {
+    settings.palette = v.palette;
+  }
 }
 
 export function saveSettings() {
