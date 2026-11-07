@@ -1,5 +1,5 @@
 // 外部ライブラリなしで PDF を組み立てる（各ページを JPEG 画像として埋め込む）
-import { PAGE_W, PAGE_H, renderPage } from './render.js';
+import { PAGE_W, PAGE_H, renderPage, preloadImages } from './render.js';
 import { openDialog, toast, saveFile, safeFileName } from './ui.js';
 
 const PX_W = 1240; // 約150dpi（A4）
@@ -14,6 +14,7 @@ function pdfText(s) {
 }
 
 export async function pagesToPdf(pages, title, onProgress) {
+  await preloadImages(pages);
   const canvas = document.createElement('canvas');
   canvas.width = PX_W;
   canvas.height = PX_H;

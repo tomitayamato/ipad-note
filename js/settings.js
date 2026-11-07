@@ -10,6 +10,7 @@ const DEFAULTS = {
   activePen: 0,
   eraserWidth: ERASER.def,
   fingerDraw: false,
+  shapeSnap: true, // 書き終わりでペンを止めると図形に補正
 };
 
 export const settings = JSON.parse(JSON.stringify(DEFAULTS));
@@ -26,6 +27,7 @@ export async function loadSettings() {
   if (v.activePen === 0 || v.activePen === 1) settings.activePen = v.activePen;
   if (typeof v.eraserWidth === 'number') settings.eraserWidth = v.eraserWidth;
   settings.fingerDraw = !!v.fingerDraw;
+  if (typeof v.shapeSnap === 'boolean') settings.shapeSnap = v.shapeSnap;
 }
 
 export function saveSettings() {

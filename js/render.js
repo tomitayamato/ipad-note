@@ -131,8 +131,59 @@ export function drawInk(ctx, strokes) {
   for (const s of strokes) drawStroke(ctx, s);
 }
 
+/* ---------- 貼り付けた画像（用紙とインクの間に描く：画像の上から書き込める） ---------- */
+const imgCache = new Map(); // item.id -> HTMLImageElement
+let onImageLoad = null;
+export function setImageLoadHandler(fn) {
+  onImageLoad = fn;
+}
+
+function getImage(item) {
+  let im = imgCache.get(item.id);
+  if (!im) {
+    im = new Image();
+    im.addEventListener('load', () => onImageLoad && onImageLoad());
+    im.src = item.src;
+    imgCache.set(item.id, im);
+  }
+  return im.complete && im.naturalWidth ? im : null;
+}
+
+export function drawImages(ctx, page) {
+  for (const it of page.images || []) {
+    const im = getImage(it);
+    if (im) {
+      ctx.drawImage(im, it.x, it.y, it.w, it.h);
+    } else {
+      ctx.save();
+      ctx.fillStyle = '#f1eee9';
+      ctx.fillRect(it.x, it.y, it.w, it.h);
+      ctx.restore();
+    }
+  }
+}
+
+// PDF・サムネイル用：画像の読み込みを待つ
+export function preloadImages(pages) {
+  const waits = [];
+  for (const p of pages) {
+    for (const it of p.images || []) {
+      getImage(it);
+      const im = imgCache.get(it.id);
+      if (!im.complete) {
+        waits.push(new Promise((r) => {
+          im.addEventListener('load', r, { once: true });
+          im.addEventListener('error', r, { once: true });
+        }));
+      }
+    }
+  }
+  return Promise.all(waits);
+}
+
 export function renderPage(ctx, page) {
   drawPaper(ctx, page.paper);
+  drawImages(ctx, page);
   const { width, height } = ctx.canvas;
   if (!scratch) scratch = document.createElement('canvas');
   if (scratch.width !== width || scratch.height !== height) {
