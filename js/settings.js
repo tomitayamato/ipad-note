@@ -1,27 +1,30 @@
 import { db } from './db.js';
+import { PENS, ERASER } from './render.js';
 
 const DEFAULTS = {
-  pen: {
-    type: 'ballpoint',
-    ballpoint: { color: '#1f1f1f', widthIdx: 1 },
-    magic: { color: '#1a73e8', widthIdx: 1 },
-    marker: { color: '#f9ab00', widthIdx: 1 },
-  },
-  favorites: [],
+  // 上部に置く2本のペン（よく使う：黒ペン・赤ペン）
+  pens: [
+    { type: 'ballpoint', color: '#1f1f1f', width: 3.5 },
+    { type: 'ballpoint', color: '#d93025', width: 3.5 },
+  ],
+  activePen: 0,
+  eraserWidth: ERASER.def,
   fingerDraw: false,
 };
 
 export const settings = JSON.parse(JSON.stringify(DEFAULTS));
 
+function validPen(p) {
+  return p && PENS[p.type] && typeof p.color === 'string' && typeof p.width === 'number';
+}
+
 export async function loadSettings() {
   const rec = await db.get('meta', 'settings');
   if (!rec) return;
   const v = rec.value || {};
-  Object.assign(settings.pen, v.pen || {});
-  for (const k of ['ballpoint', 'magic', 'marker']) {
-    settings.pen[k] = { ...DEFAULTS.pen[k], ...(v.pen && v.pen[k]) };
-  }
-  settings.favorites = Array.isArray(v.favorites) ? v.favorites : [];
+  if (Array.isArray(v.pens) && v.pens.length === 2 && v.pens.every(validPen)) settings.pens = v.pens;
+  if (v.activePen === 0 || v.activePen === 1) settings.activePen = v.activePen;
+  if (typeof v.eraserWidth === 'number') settings.eraserWidth = v.eraserWidth;
   settings.fingerDraw = !!v.fingerDraw;
 }
 
@@ -30,6 +33,5 @@ export function saveSettings() {
 }
 
 export function currentPen() {
-  const type = settings.pen.type;
-  return { type, ...settings.pen[type] };
+  return settings.pens[settings.activePen];
 }

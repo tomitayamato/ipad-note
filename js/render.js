@@ -2,11 +2,15 @@
 export const PAGE_W = 1000;
 export const PAGE_H = 1414; // A4 比率
 
+// 太さはページ座標（ページ幅 = 1000）での値
 export const PENS = {
-  ballpoint: { label: 'ボールペン', widths: [2, 3.5, 6], pressure: true, alpha: 1 },
-  magic: { label: 'マジックペン', widths: [6, 10, 16], pressure: false, alpha: 1 },
-  marker: { label: 'マーカー', widths: [14, 24, 36], pressure: false, alpha: 0.35 },
+  ballpoint: { label: 'ボールペン', min: 1, max: 12, def: 3.5, pressure: true, alpha: 1 },
+  magic: { label: 'マジックペン', min: 4, max: 30, def: 10, pressure: false, alpha: 1 },
+  marker: { label: 'マーカー', min: 10, max: 60, def: 24, pressure: false, alpha: 0.35 },
 };
+
+export const ERASER = { min: 6, max: 120, def: 30 };
+const ERASER_STYLE = { pressure: false, alpha: 1 };
 
 export const COLORS = ['#1f1f1f', '#5f6368', '#d93025', '#e8710a', '#f9ab00', '#188038', '#1a73e8', '#8e44ad'];
 
@@ -49,12 +53,31 @@ function widthAt(s, p) {
 }
 
 export function drawStroke(ctx, s) {
-  const pen = PENS[s.tool] || PENS.ballpoint;
+  const isEraser = s.tool === 'eraser';
+  const pen = isEraser ? ERASER_STYLE : PENS[s.tool] || PENS.ballpoint;
   const pts = s.points;
   if (!pts || !pts.length) return;
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
+  if (isEraser) {
+    // 消しゴム：インク層を丸いブラシで削る（本物の消しゴムのように部分的に消える）
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.strokeStyle = ctx.fillStyle = '#000';
+    ctx.lineWidth = s.width;
+    if (pts.length === 1) {
+      ctx.beginPath();
+      ctx.arc(pts[0][0], pts[0][1], s.width / 2, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.stroke();
+    }
+    ctx.restore();
+    return;
+  }
   ctx.strokeStyle = s.color;
   ctx.fillStyle = s.color;
   if (pen.alpha < 1) {
@@ -101,46 +124,28 @@ export function drawStroke(ctx, s) {
   ctx.restore();
 }
 
+// 線はインク層（透明なキャンバス）に描いてから用紙に重ねる。
+// こうすると消しゴム（destination-out）が用紙の罫線を消さずに線だけを消せる。
+let scratch = null;
+export function drawInk(ctx, strokes) {
+  for (const s of strokes) drawStroke(ctx, s);
+}
+
 export function renderPage(ctx, page) {
   drawPaper(ctx, page.paper);
-  for (const s of page.strokes) drawStroke(ctx, s);
-}
-
-// 消しゴムの当たり判定
-const bboxCache = new WeakMap();
-function bbox(s) {
-  let b = bboxCache.get(s);
-  if (!b) {
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (const [x, y] of s.points) {
-      if (x < x0) x0 = x;
-      if (y < y0) y0 = y;
-      if (x > x1) x1 = x;
-      if (y > y1) y1 = y;
-    }
-    b = [x0, y0, x1, y1];
-    bboxCache.set(s, b);
+  const { width, height } = ctx.canvas;
+  if (!scratch) scratch = document.createElement('canvas');
+  if (scratch.width !== width || scratch.height !== height) {
+    scratch.width = width;
+    scratch.height = height;
   }
-  return b;
-}
-
-function distSeg(px, py, a, b) {
-  const dx = b[0] - a[0];
-  const dy = b[1] - a[1];
-  const len2 = dx * dx + dy * dy;
-  let t = len2 ? ((px - a[0]) * dx + (py - a[1]) * dy) / len2 : 0;
-  t = Math.max(0, Math.min(1, t));
-  return Math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy));
-}
-
-export function hitStroke(s, x, y, r) {
-  const rr = r + s.width / 2;
-  const [x0, y0, x1, y1] = bbox(s);
-  if (x < x0 - rr || x > x1 + rr || y < y0 - rr || y > y1 + rr) return false;
-  const pts = s.points;
-  if (pts.length === 1) return Math.hypot(pts[0][0] - x, pts[0][1] - y) <= rr;
-  for (let i = 1; i < pts.length; i++) {
-    if (distSeg(x, y, pts[i - 1], pts[i]) <= rr) return true;
-  }
-  return false;
+  const ictx = scratch.getContext('2d');
+  ictx.setTransform(1, 0, 0, 1, 0, 0);
+  ictx.clearRect(0, 0, width, height);
+  ictx.setTransform(ctx.getTransform());
+  drawInk(ictx, page.strokes);
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(scratch, 0, 0);
+  ctx.restore();
 }

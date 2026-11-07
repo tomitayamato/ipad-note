@@ -1,6 +1,6 @@
 // ノート編集画面：描画・ジェスチャー・ページ操作・ペン設定
 import { db, uid } from './db.js';
-import { PAGE_W, PAGE_H, PENS, COLORS, PAPERS, renderPage, drawStroke, hitStroke } from './render.js';
+import { PAGE_W, PAGE_H, PENS, ERASER, COLORS, PAPERS, renderPage, drawPaper, drawInk, drawStroke } from './render.js';
 import { $, el, showMenu, toast, confirmDialog } from './ui.js';
 import { settings, saveSettings, currentPen } from './settings.js';
 
@@ -9,6 +9,8 @@ const base = $('#base-canvas');
 const live = $('#live-canvas');
 const bctx = base.getContext('2d');
 const lctx = live.getContext('2d');
+const ink = document.createElement('canvas'); // 線だけの層（消しゴムで削る対象）
+const ictx = ink.getContext('2d');
 const pagesPanel = $('#pages-panel');
 const penPanel = $('#pen-panel');
 
@@ -23,7 +25,7 @@ let W = 0, H = 0, dpr = 1;
 let stageRect = null;
 
 let tool = 'pen'; // 'pen' | 'eraser'
-const ERASER_R = 12;
+let lastInputType = null;
 
 const history = new Map(); // pageId -> { undo: [], redo: [] }
 const dirtyPages = new Set();
@@ -51,12 +53,11 @@ export async function openEditor(notebook, opts) {
   resize();
   resetView();
   redraw();
-  renderFavorites();
   updateUI();
 }
 
 export async function closeEditor() {
-  if (stroke || erasing) endDraw();
+  if (stroke) endDraw();
   closePanels();
   await flush();
   isOpen = false;
@@ -101,9 +102,11 @@ function resize() {
   W = r.width;
   H = r.height;
   dpr = window.devicePixelRatio || 1;
-  for (const c of [base, live]) {
+  for (const c of [base, live, ink]) {
     c.width = Math.round(W * dpr);
     c.height = Math.round(H * dpr);
+  }
+  for (const c of [base, live]) {
     c.style.width = W + 'px';
     c.style.height = H + 'px';
   }
@@ -135,7 +138,17 @@ function clipPage(ctx) {
   ctx.clip();
 }
 
-function redraw() {
+// インク層を作り直す（ページ切替・拡大・元に戻すなど）
+function renderInk() {
+  ictx.setTransform(1, 0, 0, 1, 0, 0);
+  ictx.clearRect(0, 0, ink.width, ink.height);
+  if (!pages[cur]) return;
+  applyT(ictx);
+  drawInk(ictx, pages[cur].strokes);
+}
+
+// 背景＋用紙＋インク層を画面に合成
+function composite() {
   if (!pages[cur]) return;
   bctx.setTransform(1, 0, 0, 1, 0, 0);
   bctx.fillStyle = '#e9e6e1';
@@ -150,8 +163,15 @@ function redraw() {
   bctx.restore();
   bctx.save();
   clipPage(bctx);
-  renderPage(bctx, pages[cur]);
+  drawPaper(bctx, pages[cur].paper);
+  bctx.setTransform(1, 0, 0, 1, 0, 0);
+  bctx.drawImage(ink, 0, 0);
   bctx.restore();
+}
+
+function redraw() {
+  renderInk();
+  composite();
   renderLive();
 }
 
@@ -162,6 +182,16 @@ function scheduleRedraw() {
   requestAnimationFrame(() => {
     redrawQueued = false;
     redraw();
+  });
+}
+
+let compositeQueued = false;
+function scheduleComposite() {
+  if (compositeQueued) return;
+  compositeQueued = true;
+  requestAnimationFrame(() => {
+    compositeQueued = false;
+    composite();
   });
 }
 
@@ -178,23 +208,24 @@ function scheduleLive() {
 function renderLive() {
   lctx.setTransform(1, 0, 0, 1, 0, 0);
   lctx.clearRect(0, 0, live.width, live.height);
-  if (!stroke && !erasing) return;
+  if (!stroke) return;
   applyT(lctx);
-  if (stroke) {
-    lctx.save();
-    clipPage(lctx);
-    drawStroke(lctx, stroke);
-    lctx.restore();
-  }
-  if (erasing && eraserPos) {
+  if (stroke.tool === 'eraser') {
+    // 消しゴムの範囲を丸で表示
+    const [x, y] = stroke.points[stroke.points.length - 1];
     lctx.beginPath();
-    lctx.arc(eraserPos[0], eraserPos[1], ERASER_R, 0, Math.PI * 2);
+    lctx.arc(x, y, stroke.width / 2, 0, Math.PI * 2);
     lctx.lineWidth = 1.5 / view.s;
     lctx.strokeStyle = 'rgba(80,80,80,0.8)';
-    lctx.fillStyle = 'rgba(255,255,255,0.5)';
+    lctx.fillStyle = 'rgba(255,255,255,0.35)';
     lctx.fill();
     lctx.stroke();
+    return;
   }
+  lctx.save();
+  clipPage(lctx);
+  drawStroke(lctx, stroke);
+  lctx.restore();
 }
 
 window.addEventListener('resize', () => {
@@ -205,9 +236,7 @@ window.addEventListener('resize', () => {
 });
 
 /* ================= 描画 ================= */
-let stroke = null;
-let erasing = null;
-let eraserPos = null;
+let stroke = null; // 描いている途中の線（ペン or 消しゴム）
 let drawPointerId = null;
 let drawPointerType = null;
 
@@ -222,91 +251,89 @@ function pressureOf(e) {
 
 const r2 = (v) => Math.round(v * 100) / 100;
 
+// 消しゴムの一区間をインク層から削る
+function eraseSegment(a, b, width) {
+  applyT(ictx);
+  ictx.save();
+  ictx.globalCompositeOperation = 'destination-out';
+  ictx.fillStyle = ictx.strokeStyle = '#000';
+  ictx.lineCap = 'round';
+  ictx.lineWidth = width;
+  ictx.beginPath();
+  if (a === b) {
+    ictx.arc(a[0], a[1], width / 2, 0, Math.PI * 2);
+    ictx.fill();
+  } else {
+    ictx.moveTo(a[0], a[1]);
+    ictx.lineTo(b[0], b[1]);
+    ictx.stroke();
+  }
+  ictx.restore();
+}
+
 function beginDraw(e) {
   const [x, y] = toPage(e);
   if (tool === 'eraser') {
-    erasing = { type: 'erase', items: [] };
-    eraserPos = [x, y];
-    eraseAt(x, y);
+    stroke = { tool: 'eraser', width: settings.eraserWidth, points: [[r2(x), r2(y)]] };
+    eraseSegment(stroke.points[0], stroke.points[0], stroke.width);
+    scheduleComposite();
     scheduleLive();
     return;
   }
   const pen = currentPen();
-  stroke = {
-    tool: pen.type,
-    color: pen.color,
-    width: PENS[pen.type].widths[pen.widthIdx],
-    points: [[r2(x), r2(y), r2(pressureOf(e))]],
-  };
+  stroke = { tool: pen.type, color: pen.color, width: pen.width, points: [[r2(x), r2(y), r2(pressureOf(e))]] };
   scheduleLive();
 }
 
 function moveDraw(e) {
+  if (!stroke) return;
   const evs = (e.getCoalescedEvents && e.getCoalescedEvents()) || [];
   for (const ev of evs.length ? evs : [e]) {
     const [x, y] = toPage(ev);
-    if (erasing) {
-      const [lx, ly] = eraserPos;
-      const steps = Math.max(1, Math.ceil(Math.hypot(x - lx, y - ly) / 5));
-      for (let i = 1; i <= steps; i++) eraseAt(lx + ((x - lx) * i) / steps, ly + ((y - ly) * i) / steps);
-      eraserPos = [x, y];
-      continue;
-    }
-    if (!stroke) continue;
     const last = stroke.points[stroke.points.length - 1];
     if (Math.hypot(x - last[0], y - last[1]) < 0.5) continue;
-    const p = last[2] * 0.6 + pressureOf(ev) * 0.4;
-    stroke.points.push([r2(x), r2(y), r2(p)]);
+    if (stroke.tool === 'eraser') {
+      const p = [r2(x), r2(y)];
+      stroke.points.push(p);
+      eraseSegment(last, p, stroke.width);
+    } else {
+      const p = last[2] * 0.6 + pressureOf(ev) * 0.4;
+      stroke.points.push([r2(x), r2(y), r2(p)]);
+    }
   }
+  if (stroke.tool === 'eraser') scheduleComposite();
   scheduleLive();
 }
 
+// 線を確定する（キャンセルされた場合も、描いた分は残す）
 function endDraw() {
   drawPointerId = null;
   drawPointerType = null;
-  if (erasing) {
-    if (erasing.items.length) {
-      pushHistory(erasing);
-      markDirty();
-    }
-    erasing = null;
-    eraserPos = null;
-    renderLive();
-    return;
-  }
   if (!stroke) return;
   const s = stroke;
   stroke = null;
   pages[cur].strokes.push(s);
   pushHistory({ type: 'add', stroke: s });
-  applyT(bctx);
-  bctx.save();
-  clipPage(bctx);
-  drawStroke(bctx, s);
-  bctx.restore();
+  if (s.tool !== 'eraser') {
+    applyT(ictx);
+    drawStroke(ictx, s);
+  }
+  composite();
   renderLive();
   markDirty();
 }
 
+// 描きかけを取り消す（2本指ピンチに切り替わった時など）
 function abortDraw() {
+  const wasEraser = stroke && stroke.tool === 'eraser';
   stroke = null;
-  endDraw();
+  drawPointerId = null;
+  drawPointerType = null;
+  if (wasEraser) redraw();
+  else renderLive();
 }
 
-function eraseAt(x, y) {
-  const list = pages[cur].strokes;
-  let changed = false;
-  for (let i = list.length - 1; i >= 0; i--) {
-    if (hitStroke(list[i], x, y, ERASER_R)) {
-      erasing.items.push({ stroke: list[i], index: i });
-      list.splice(i, 1);
-      changed = true;
-    }
-  }
-  if (changed) scheduleRedraw();
-}
-
-/* ================= 元に戻す・やり直す ================= */
+/* ================= 元に戻す・やり直す・全消し ================= */
 function hist() {
   const id = pages[cur].id;
   if (!history.has(id)) history.set(id, { undo: [], redo: [] });
@@ -322,31 +349,23 @@ function pushHistory(op) {
 }
 
 function revert(op) {
-  const s = pages[cur].strokes;
+  const page = pages[cur];
   if (op.type === 'add') {
-    const i = s.lastIndexOf(op.stroke);
-    if (i >= 0) s.splice(i, 1);
-  } else {
-    for (let k = op.items.length - 1; k >= 0; k--) {
-      const it = op.items[k];
-      s.splice(Math.min(it.index, s.length), 0, it.stroke);
-    }
+    const i = page.strokes.lastIndexOf(op.stroke);
+    if (i >= 0) page.strokes.splice(i, 1);
+  } else if (op.type === 'clear') {
+    page.strokes = op.prev;
   }
 }
 
 function reapply(op) {
-  const s = pages[cur].strokes;
-  if (op.type === 'add') s.push(op.stroke);
-  else {
-    for (const it of op.items) {
-      const i = s.indexOf(it.stroke);
-      if (i >= 0) s.splice(i, 1);
-    }
-  }
+  const page = pages[cur];
+  if (op.type === 'add') page.strokes.push(op.stroke);
+  else if (op.type === 'clear') page.strokes = [];
 }
 
 function undo() {
-  if (stroke || erasing) return;
+  if (stroke) return;
   const h = hist();
   const op = h.undo.pop();
   if (!op) return;
@@ -358,7 +377,7 @@ function undo() {
 }
 
 function redo() {
-  if (stroke || erasing) return;
+  if (stroke) return;
   const h = hist();
   const op = h.redo.pop();
   if (!op) return;
@@ -367,6 +386,18 @@ function redo() {
   redraw();
   markDirty();
   updateUI();
+}
+
+async function clearPage() {
+  if (!pages[cur].strokes.length) return toast('このページには何も書かれていません');
+  closePanels();
+  const ok = await confirmDialog('このページに書いた内容をすべて消しますか？\n（元に戻すボタンで戻せます）', '全消し', true);
+  if (!ok) return;
+  const page = pages[cur];
+  pushHistory({ type: 'clear', prev: page.strokes });
+  page.strokes = [];
+  redraw();
+  markDirty();
 }
 
 /* ================= ポインター（ペン・指・マウス） ================= */
@@ -418,13 +449,30 @@ function startGesture({ allowSwipe = true } = {}) {
   }
 }
 
+// iOS の標準ジェスチャー（ダブルタップ判定・拡大鏡など）を止める。
+// これが動くと、速い連続タップの線がキャンセルされることがある。
+for (const type of ['touchstart', 'touchmove', 'touchend']) {
+  stage.addEventListener(type, (e) => e.preventDefault(), { passive: false });
+}
+
 stage.addEventListener('pointerdown', (e) => {
   if (panelsOpen()) {
     closePanels();
-    return;
+    if (e.pointerType !== 'pen') return; // ペンならそのまま書き始める
   }
   stageRect = stage.getBoundingClientRect();
   if (e.pointerType === 'mouse' && e.button !== 0) return;
+  lastInputType = e.pointerType;
+
+  // 取りこぼした「離した」イベントの後始末（速い連続タップ対策）
+  if (e.isPrimary) {
+    if (drawPointerId !== null && drawPointerType === e.pointerType) endDraw();
+    if (e.pointerType === 'touch' && touches.size) {
+      touches.clear();
+      gesture = null;
+      clearTimeout(lpTimer);
+    }
+  }
   if (e.pointerType === 'pen') cancelTouchGesture();
 
   if (drawPointerId === null && canDraw(e) && !(e.pointerType === 'touch' && touches.size > 0)) {
@@ -490,8 +538,10 @@ stage.addEventListener('pointermove', (e) => {
 function onPointerEnd(e) {
   if (e.pointerId === drawPointerId) {
     touches.delete(e.pointerId);
-    if (e.type === 'pointercancel') abortDraw();
-    else endDraw();
+    if (e.type === 'pointerup' || e.type === 'pointercancel') {
+      // pointercancel でも線は捨てずに確定する（iPadで速く書いた時に起きる）
+      endDraw();
+    }
     return;
   }
   if (!touches.has(e.pointerId)) return;
@@ -559,7 +609,7 @@ function turnAnim(dir) {
 
 function goTo(i, anim = 0) {
   if (i < 0 || i >= pages.length) return;
-  if (stroke || erasing) endDraw();
+  if (stroke) endDraw();
   cur = i;
   nb.lastPage = i;
   markDirty(pages[cur]);
@@ -632,7 +682,7 @@ function movePage(i, dir) {
 function setPaper(i, paper) {
   pages[i].paper = paper;
   markDirty(pages[i]);
-  if (i === cur) redraw();
+  if (i === cur) composite();
   renderPagesPanel();
 }
 
@@ -642,6 +692,7 @@ function openPageMenu(x, y) {
     { label: '1冊まるごとPDFに書き出し', action: exportAll },
     '-',
     { label: 'ページを追加', action: async () => goTo(await addPage(cur + 1), 1) },
+    { label: 'このページを全消し', danger: true, action: clearPage },
   ]);
 }
 
@@ -693,146 +744,146 @@ function togglePagesPanel() {
   if (open) renderPagesPanel();
 }
 
-/* ================= ペン設定パネル ================= */
-function samePen(a, b) {
-  return a.type === b.type && a.color === b.color && a.widthIdx === b.widthIdx;
+/* ================= ペン・消しゴムの設定パネル ================= */
+function section(label, content) {
+  return el('div', { class: 'pp-section' }, [el('div', { class: 'pp-label', text: label }), content]);
 }
 
-function penChanged() {
-  tool = 'pen';
-  saveSettings();
-  renderPenPanel();
-  renderFavorites();
-  updateUI();
+// 太さのスライダー（プレビュー付き）
+function widthSlider({ min, max, value, previewFor, onInput }) {
+  const fmt = (v) => (Math.round(v * 10) / 10).toString();
+  const range = el('input', { type: 'range', min, max, step: '0.5', value: String(value) });
+  const label = el('span', { class: 'slider-val', text: fmt(value) });
+  const preview = el('div', { class: 'width-preview' });
+  const drawPreview = (v) => {
+    preview.innerHTML = previewFor(v * view.fit); // 拡大していない時の画面上の太さで表示
+  };
+  drawPreview(value);
+  range.addEventListener('input', () => {
+    const v = parseFloat(range.value);
+    label.textContent = fmt(v);
+    drawPreview(v);
+    onInput(v);
+  });
+  range.addEventListener('change', saveSettings);
+  return el('div', { class: 'slider-box' }, [preview, el('div', { class: 'slider-row' }, [range, label])]);
 }
 
 function renderPenPanel() {
-  const P = settings.pen;
-  const cfg = P[P.type];
-  const pen = PENS[P.type];
   penPanel.innerHTML = '';
+  if (tool === 'eraser') return renderEraserPanel();
+
+  const pen = currentPen();
+  const def = PENS[pen.type];
+  penPanel.append(el('div', { class: 'pp-title', text: `ペン${settings.activePen + 1}の設定` }));
 
   const types = el('div', { class: 'seg' });
   for (const [k, v] of Object.entries(PENS)) {
-    types.append(el('button', { class: k === P.type ? 'active' : '', text: v.label, onclick: () => { P.type = k; penChanged(); } }));
-  }
-
-  const widths = el('div', { class: 'width-row' });
-  pen.widths.forEach((w, idx) => {
-    const sw = Math.min(22, Math.max(2, w * 0.7));
-    widths.append(
+    types.append(
       el('button', {
-        class: 'width-btn' + (idx === cfg.widthIdx ? ' active' : ''),
-        'aria-label': `太さ${idx + 1}`,
-        html: `<svg viewBox="0 0 80 30"><path d="M8 18 C 24 6, 44 26, 72 12" fill="none" stroke="${cfg.color}" stroke-width="${sw}" stroke-linecap="round" opacity="${pen.alpha < 1 ? 0.5 : 1}"/></svg>`,
-        onclick: () => { cfg.widthIdx = idx; penChanged(); },
+        class: k === pen.type ? 'active' : '',
+        text: v.label,
+        onclick: () => {
+          if (pen.type === k) return;
+          pen.type = k;
+          pen.width = PENS[k].def; // 種類を変えたらその種類の標準の太さに
+          penChanged();
+        },
       }),
     );
+  }
+
+  const slider = widthSlider({
+    min: def.min,
+    max: def.max,
+    value: Math.min(def.max, Math.max(def.min, pen.width)),
+    previewFor: (w) =>
+      `<svg viewBox="0 0 240 44"><path d="M14 26 C 60 6, 110 40, 160 20 S 220 14, 226 22" fill="none" stroke="${pen.color}" stroke-width="${Math.max(1, w)}" stroke-linecap="round" opacity="${def.alpha < 1 ? 0.45 : 1}"/></svg>`,
+    onInput: (v) => {
+      pen.width = v;
+    },
   });
 
   const colors = el('div', { class: 'swatches' });
   for (const c of COLORS) {
     colors.append(
       el('button', {
-        class: 'swatch' + (c === cfg.color ? ' selected' : ''),
+        class: 'swatch' + (c === pen.color ? ' selected' : ''),
         style: `background:${c}`,
         'aria-label': c,
-        onclick: () => { cfg.color = c; penChanged(); },
+        onclick: () => {
+          pen.color = c;
+          penChanged();
+        },
       }),
     );
   }
 
-  const favs = el('div', { class: 'fav-edit' });
-  settings.favorites.forEach((f, i) => {
-    favs.append(
-      el('div', { class: 'fav-chip' }, [
-        favDot(f),
-        el('span', { text: PENS[f.type].label }),
-        el('button', {
-          class: 'fav-del',
-          text: '×',
-          'aria-label': '登録を解除',
-          onclick: () => { settings.favorites.splice(i, 1); penChanged(); },
-        }),
-      ]),
-    );
-  });
-  const curPen = currentPen();
-  const already = settings.favorites.some((f) => samePen(f, curPen));
-  favs.append(
-    el('button', {
-      class: 'fav-add',
-      text: already ? '登録済み' : '＋ 今のペンを登録',
-      disabled: already ? '' : null,
-      onclick: () => {
-        if (settings.favorites.length >= 6) return toast('登録は6本までです');
-        settings.favorites.push({ type: curPen.type, color: curPen.color, widthIdx: curPen.widthIdx });
-        penChanged();
-      },
-    }),
-  );
+  penPanel.append(section('ペンの種類', types), section('太さ', slider), section('色', colors), fingerRow());
+}
 
+function renderEraserPanel() {
+  penPanel.append(el('div', { class: 'pp-title', text: '消しゴムの設定' }));
+  const slider = widthSlider({
+    min: ERASER.min,
+    max: ERASER.max,
+    value: settings.eraserWidth,
+    previewFor: (w) => {
+      const d = Math.min(120, Math.max(4, w));
+      return `<div class="eraser-dot" style="width:${d}px;height:${d}px"></div>`;
+    },
+    onInput: (v) => {
+      settings.eraserWidth = v;
+    },
+  });
+  penPanel.append(
+    section('太さ', slider),
+    el('div', { class: 'pp-section' }, [
+      el('button', { class: 'clear-btn', text: 'このページを全消し', onclick: clearPage }),
+    ]),
+    fingerRow(),
+  );
+}
+
+function fingerRow() {
   const finger = el('input', { type: 'checkbox' });
   finger.checked = settings.fingerDraw;
   finger.addEventListener('change', () => {
     settings.fingerDraw = finger.checked;
     saveSettings();
   });
-
-  penPanel.append(
-    section('ペンの種類', types),
-    section('太さ', widths),
-    section('色', colors),
-    section('よく使うペン', favs),
-    el('label', { class: 'switch-row' }, [
-      el('span', { html: '指でも描く<small>オフ：指はスワイプ・拡大・長押しメニュー用</small>' }),
-      finger,
-    ]),
-  );
+  const kind = { pen: 'ペン（Apple Pencil型）', touch: '指（タッチ）', mouse: 'マウス' }[lastInputType];
+  return el('label', { class: 'switch-row' }, [
+    el('span', {
+      html:
+        '指でも描く<small>オフ：指はスワイプ・拡大・長押しメニュー用' +
+        (kind ? `<br>最後に検出した入力：${kind}` : '') +
+        '</small>',
+    }),
+    finger,
+  ]);
 }
 
-function section(label, content) {
-  return el('div', { class: 'pp-section' }, [el('div', { class: 'pp-label', text: label }), content]);
+function penChanged() {
+  saveSettings();
+  renderPenPanel();
+  updateUI();
 }
 
-function favDot(f) {
-  const size = [10, 14, 18][f.widthIdx] || 14;
-  return el('span', {
-    class: 'fav-dot ' + f.type,
-    style: `background:${f.color};width:${size}px;height:${size}px`,
-  });
-}
-
-function renderFavorites() {
-  const box = $('#favorites');
-  box.innerHTML = '';
-  const curPen = currentPen();
-  for (const f of settings.favorites) {
-    box.append(
-      el('button', {
-        class: 'fav' + (tool === 'pen' && samePen(f, curPen) ? ' active' : ''),
-        'aria-label': PENS[f.type].label,
-        onclick: () => {
-          settings.pen.type = f.type;
-          settings.pen[f.type] = { color: f.color, widthIdx: f.widthIdx };
-          penChanged();
-        },
-      }, favDot(f)),
-    );
-  }
-}
-
-function togglePenPanel() {
-  const show = penPanel.classList.contains('hidden');
+function openPanel() {
   pagesPanel.classList.remove('open');
   $('#pages-btn').classList.remove('active');
-  if (!show) return penPanel.classList.add('hidden');
   renderPenPanel();
   penPanel.classList.remove('hidden');
-  const btn = $('#pen-settings-btn').getBoundingClientRect();
+  const anchor = (tool === 'eraser' ? $('#eraser-btn') : $(`#pen${settings.activePen + 1}-btn`)).getBoundingClientRect();
   const body = penPanel.parentElement.getBoundingClientRect();
   const w = penPanel.offsetWidth;
-  penPanel.style.left = Math.min(Math.max(8, btn.left + btn.width / 2 - w / 2 - body.left), body.width - w - 8) + 'px';
+  penPanel.style.left = Math.min(Math.max(8, anchor.left + anchor.width / 2 - w / 2 - body.left), body.width - w - 8) + 'px';
+}
+
+function togglePanel() {
+  if (penPanel.classList.contains('hidden')) openPanel();
+  else penPanel.classList.add('hidden');
 }
 
 function panelsOpen() {
@@ -845,6 +896,23 @@ function closePanels() {
   $('#pages-btn').classList.remove('active');
 }
 
+// ペン1・ペン2：選択中のボタンをもう一度押すと設定が開く
+function selectPen(i) {
+  if (tool === 'pen' && settings.activePen === i) return togglePanel();
+  tool = 'pen';
+  settings.activePen = i;
+  saveSettings();
+  penPanel.classList.add('hidden');
+  updateUI();
+}
+
+function selectEraser() {
+  if (tool === 'eraser') return togglePanel();
+  tool = 'eraser';
+  penPanel.classList.add('hidden');
+  updateUI();
+}
+
 /* ================= ツールバー ================= */
 function updateUI() {
   if (!nb) return;
@@ -853,14 +921,14 @@ function updateUI() {
   const h = history.get(pages[cur].id);
   $('#undo-btn').disabled = !h || !h.undo.length;
   $('#redo-btn').disabled = !h || !h.redo.length;
-  $('#pen-btn').classList.toggle('active', tool === 'pen');
-  $('#eraser-btn').classList.toggle('active', tool === 'eraser');
-  const p = currentPen();
-  $('.pen-dot').style.background = p.color;
-  const curPen = currentPen();
-  [...$('#favorites').children].forEach((b, i) => {
-    b.classList.toggle('active', tool === 'pen' && samePen(settings.favorites[i], curPen));
+  settings.pens.forEach((p, i) => {
+    const btn = $(`#pen${i + 1}-btn`);
+    btn.classList.toggle('active', tool === 'pen' && settings.activePen === i);
+    btn.style.setProperty('--pen-color', p.color);
+    btn.title = `ペン${i + 1}（${PENS[p.type].label}）`;
   });
+  $('#eraser-btn').classList.toggle('active', tool === 'eraser');
+  if (!penPanel.classList.contains('hidden')) openPanel();
 }
 
 $('#back-btn').addEventListener('click', () => hooks.onExit && hooks.onExit());
@@ -872,19 +940,10 @@ $('#add-page-btn').addEventListener('click', async () => {
 });
 $('#undo-btn').addEventListener('click', undo);
 $('#redo-btn').addEventListener('click', redo);
-$('#pen-btn').addEventListener('click', () => {
-  if (tool === 'pen') return togglePenPanel();
-  tool = 'pen';
-  updateUI();
-  renderFavorites();
-});
-$('#eraser-btn').addEventListener('click', () => {
-  tool = 'eraser';
-  penPanel.classList.add('hidden');
-  updateUI();
-  renderFavorites();
-});
-$('#pen-settings-btn').addEventListener('click', togglePenPanel);
+$('#pen1-btn').addEventListener('click', () => selectPen(0));
+$('#pen2-btn').addEventListener('click', () => selectPen(1));
+$('#eraser-btn').addEventListener('click', selectEraser);
+$('#pen-settings-btn').addEventListener('click', togglePanel);
 $('#more-btn').addEventListener('click', (e) => {
   const r = e.currentTarget.getBoundingClientRect();
   openPageMenu(r.right - 240, r.bottom + 6);
@@ -894,6 +953,7 @@ $('#next-btn').addEventListener('click', nextPage);
 
 document.addEventListener('keydown', (e) => {
   if (!isOpen || !$('#dialog').classList.contains('hidden')) return;
+  if (e.target instanceof HTMLInputElement) return;
   const mod = e.metaKey || e.ctrlKey;
   if (mod && e.key.toLowerCase() === 'z') {
     e.preventDefault();
